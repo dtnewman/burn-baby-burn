@@ -460,13 +460,20 @@ run_cli() {
 parse_usage() {
   case "$backend" in
     claude)
+      # Claude Code 2.x emits --output-format json as an array of stream events
+      # (system → assistant → result); usage/cost live on the final 'result'
+      # entry. Older versions returned a single object — handle both shapes.
       jq -r '
-        [ ((.usage.input_tokens // 0) +
-           (.usage.cache_creation_input_tokens // 0) +
-           (.usage.cache_read_input_tokens // 0) +
-           (.usage.output_tokens // 0)),
-          (.total_cost_usd // 0)
-        ] | @tsv' <<<"$last_output"
+        (if type == "array"
+           then (map(select(.type == "result")) | .[0] // .[-1])
+           else .
+         end) as $r
+        | [ (($r.usage.input_tokens // 0) +
+             ($r.usage.cache_creation_input_tokens // 0) +
+             ($r.usage.cache_read_input_tokens // 0) +
+             ($r.usage.output_tokens // 0)),
+            ($r.total_cost_usd // 0)
+          ] | @tsv' <<<"$last_output"
       ;;
     codex)
       # codex emits JSONL; sum usage across any turn.completed events.
