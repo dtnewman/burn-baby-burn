@@ -166,7 +166,7 @@ fi
 # Hard stop at 1,000,000 tokens. Past this point we feel obligated to
 # remind the user — out loud — what they actually downloaded.
 JOKE_THRESHOLD=1000000
-if ((tokens > JOKE_THRESHOLD)); then
+if ((tokens * threads > JOKE_THRESHOLD)); then
   cat >&2 <<'EOF'
 
 🔥🔥🔥  HOLD ON A SECOND  🔥🔥🔥
@@ -185,6 +185,8 @@ Refusing to proceed. Go touch grass. 🌱
 EOF
   exit 1
 fi
+
+total_target=$((tokens * threads))
 
 # ~4 chars/token is the standard rule of thumb for English text.
 target_chars=$((FILLER_TOKENS * 4))
