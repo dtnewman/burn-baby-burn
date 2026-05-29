@@ -386,16 +386,17 @@ format_cost_field() {
 }
 
 draw_bar() {
-  local pct filled empty bar="" i suffix="${1:-}"
-  pct=$((burned * 100 / tokens))
+  local pct filled empty bar="" i suffix="${1:-}" threads_label=""
+  pct=$((burned * 100 / total_target))
   ((pct > 100)) && pct=100
   filled=$((pct * BAR_WIDTH / 100))
   empty=$((BAR_WIDTH - filled))
   for ((i = 0; i < filled; i++)); do bar+='█'; done
   for ((i = 0; i < empty; i++)); do bar+='░'; done
+  ((threads > 1)) && threads_label=" • ${threads} threads"
   # \033[K clears any leftover characters from a longer previous draw.
-  printf "\r[%s] %3d%% • %d/%d tokens • %s • %d call(s)%s\033[K" \
-    "$bar" "$pct" "$burned" "$tokens" "$(format_cost_field)" "$iteration" "$suffix"
+  printf "\r[%s] %3d%% • %d/%d tokens • %s • %d call(s)%s%s\033[K" \
+    "$bar" "$pct" "$burned" "$total_target" "$(format_cost_field)" "$iteration" "$threads_label" "$suffix"
 }
 
 restore_cursor() {
@@ -574,7 +575,7 @@ done
 
 msg="${CELEBRATIONS[RANDOM % ${#CELEBRATIONS[@]}]}"
 burned_fmt=$(fmt_num "$burned")
-tokens_fmt=$(fmt_num "$tokens")
+tokens_fmt=$(fmt_num "$total_target")
 
 if ((cost_reported)); then
   cost_rounded=$(round_cents "$total_cost")
