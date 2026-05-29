@@ -550,26 +550,25 @@ draw_disco 0
 echo
 draw_bar
 
-while ((burned < tokens)); do
-  iteration=$((iteration + 1))
+while ((burned < total_target)); do
+  launch_cli_calls "$threads"
+  wait_for_cli_calls
 
-  if ! run_cli; then
-    draw_bar " (retrying)"
-    if ! run_cli; then
-      printf "\nerror: two consecutive %s calls failed; aborting.\n" "$backend" >&2
+  round_tokens=0
+  round_cost=0.000000
+  for last_output in "${last_outputs[@]}"; do
+    read -r this_call this_cost < <(parse_usage)
+    if ! [[ "$this_call" =~ ^[0-9]+$ ]]; then
+      printf "\nerror: could not parse token usage from %s output\n" "$backend" >&2
       exit 1
     fi
-  fi
+    round_tokens=$((round_tokens + this_call))
+    round_cost=$(awk -v a="$round_cost" -v b="$this_cost" 'BEGIN{printf "%.6f", a+b}')
+  done
 
-  read -r this_call this_cost < <(parse_usage)
-
-  if ! [[ "$this_call" =~ ^[0-9]+$ ]]; then
-    printf "\nerror: could not parse token usage from %s output\n" "$backend" >&2
-    exit 1
-  fi
-
-  burned=$((burned + this_call))
-  total_cost=$(awk -v a="$total_cost" -v b="$this_cost" 'BEGIN{printf "%.6f", a+b}')
+  burned=$((burned + round_tokens))
+  total_cost=$(awk -v a="$total_cost" -v b="$round_cost" 'BEGIN{printf "%.6f", a+b}')
+  iteration=$((iteration + threads))
   draw_bar
 done
 
