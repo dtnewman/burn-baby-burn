@@ -441,7 +441,12 @@ on_interrupt() {
   for pid in "${cli_pids[@]}"; do
     wait "$pid" 2>/dev/null || true
   done
+  local f
+  for f in "${cli_output_files[@]}"; do
+    rm -f "$f"
+  done
   cli_pids=()
+  cli_output_files=()
   local burned_fmt cost_msg
   burned_fmt=$(fmt_num "$burned")
   if ((cost_reported)); then
