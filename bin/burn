@@ -433,10 +433,14 @@ fmt_num() {
 }
 
 on_interrupt() {
-  if [[ -n "$cli_pid" ]]; then
-    kill "$cli_pid" 2>/dev/null || true
-    wait "$cli_pid" 2>/dev/null || true
-  fi
+  local pid
+  for pid in "${cli_pids[@]}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+  for pid in "${cli_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  cli_pids=()
   local burned_fmt cost_msg
   burned_fmt=$(fmt_num "$burned")
   if ((cost_reported)); then
