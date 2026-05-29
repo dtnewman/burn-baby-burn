@@ -34,6 +34,8 @@ Options:
   --model NAME       Model to pass through (e.g. haiku, sonnet, gpt-5).
   --backend NAME     Which CLI to drive: 'claude' or 'codex'.
                      Default: claude if installed, else codex.
+  --threads N        Run N CLI calls in parallel per batch (default: 1).
+                     Total tokens burned = TOKENS × N.
   -h, --help         Show this help and exit.
 EOF
 }
@@ -41,6 +43,7 @@ EOF
 model=""
 tokens=""
 backend=""
+threads=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
   -h | --help)
@@ -71,6 +74,18 @@ while [[ $# -gt 0 ]]; do
     backend="${1#*=}"
     shift
     ;;
+  --threads)
+    if [[ $# -lt 2 ]]; then
+      echo "error: --threads requires a value" >&2
+      exit 2
+    fi
+    threads="$2"
+    shift 2
+    ;;
+  --threads=*)
+    threads="${1#*=}"
+    shift
+    ;;
   --)
     shift
     break
@@ -97,6 +112,10 @@ if [[ -z "$tokens" ]]; then
 fi
 if ! [[ "$tokens" =~ ^[0-9]+$ ]]; then
   echo "error: TOKENS must be a positive integer (got '$tokens')" >&2
+  exit 2
+fi
+if ! [[ "$threads" =~ ^[0-9]+$ ]] || ((threads < 1)); then
+  echo "error: --threads must be a positive integer (got '$threads')" >&2
   exit 2
 fi
 
