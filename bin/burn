@@ -34,6 +34,8 @@ Options:
   --model NAME       Model to pass through (e.g. haiku, sonnet, gpt-5).
   --backend NAME     Which CLI to drive: 'claude' or 'codex'.
                      Default: claude if installed, else codex.
+  --threads N        Run N CLI calls in parallel per batch (default: 1).
+                     Total tokens burned = TOKENS × N.
   -h, --help         Show this help and exit.
 EOF
 }
@@ -41,6 +43,7 @@ EOF
 model=""
 tokens=""
 backend=""
+threads=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
   -h | --help)
@@ -71,6 +74,18 @@ while [[ $# -gt 0 ]]; do
     backend="${1#*=}"
     shift
     ;;
+  --threads)
+    if [[ $# -lt 2 ]]; then
+      echo "error: --threads requires a value" >&2
+      exit 2
+    fi
+    threads="$2"
+    shift 2
+    ;;
+  --threads=*)
+    threads="${1#*=}"
+    shift
+    ;;
   --)
     shift
     break
@@ -97,6 +112,10 @@ if [[ -z "$tokens" ]]; then
 fi
 if ! [[ "$tokens" =~ ^[0-9]+$ ]]; then
   echo "error: TOKENS must be a positive integer (got '$tokens')" >&2
+  exit 2
+fi
+if ! [[ "$threads" =~ ^[0-9]+$ ]] || ((threads < 1)); then
+  echo "error: --threads must be a positive integer (got '$threads')" >&2
   exit 2
 fi
 
@@ -147,7 +166,7 @@ fi
 # Hard stop at 1,000,000 tokens. Past this point we feel obligated to
 # remind the user — out loud — what they actually downloaded.
 JOKE_THRESHOLD=1000000
-if ((tokens > JOKE_THRESHOLD)); then
+if ((tokens * threads > JOKE_THRESHOLD)); then
   cat >&2 <<'EOF'
 
 🔥🔥🔥  HOLD ON A SECOND  🔥🔥🔥
@@ -166,6 +185,8 @@ Refusing to proceed. Go touch grass. 🌱
 EOF
   exit 1
 fi
+
+total_target=$((tokens * threads))
 
 # ~4 chars/token is the standard rule of thumb for English text.
 target_chars=$((FILLER_TOKENS * 4))
@@ -317,8 +338,9 @@ burned=0
 iteration=0
 total_cost=0.000000
 BAR_WIDTH=30
-cli_pid=""
-last_output=""
+cli_pids=()
+cli_output_files=()
+last_outputs=()
 
 # Build CLI command for the chosen backend.
 case "$backend" in
@@ -364,16 +386,17 @@ format_cost_field() {
 }
 
 draw_bar() {
-  local pct filled empty bar="" i suffix="${1:-}"
-  pct=$((burned * 100 / tokens))
+  local pct filled empty bar="" i suffix="${1:-}" threads_label=""
+  pct=$((burned * 100 / total_target))
   ((pct > 100)) && pct=100
   filled=$((pct * BAR_WIDTH / 100))
   empty=$((BAR_WIDTH - filled))
   for ((i = 0; i < filled; i++)); do bar+='█'; done
   for ((i = 0; i < empty; i++)); do bar+='░'; done
+  ((threads > 1)) && threads_label=" • ${threads} threads"
   # \033[K clears any leftover characters from a longer previous draw.
-  printf "\r[%s] %3d%% • %d/%d tokens • %s • %d call(s)%s\033[K" \
-    "$bar" "$pct" "$burned" "$tokens" "$(format_cost_field)" "$iteration" "$suffix"
+  printf "\r[%s] %3d%% • %d/%d tokens • %s • %d call(s)%s%s\033[K" \
+    "$bar" "$pct" "$burned" "$total_target" "$(format_cost_field)" "$iteration" "$threads_label" "$suffix"
 }
 
 restore_cursor() {
@@ -411,10 +434,19 @@ fmt_num() {
 }
 
 on_interrupt() {
-  if [[ -n "$cli_pid" ]]; then
-    kill "$cli_pid" 2>/dev/null || true
-    wait "$cli_pid" 2>/dev/null || true
-  fi
+  local pid
+  for pid in "${cli_pids[@]}"; do
+    kill "$pid" 2>/dev/null || true
+  done
+  for pid in "${cli_pids[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+  local f
+  for f in "${cli_output_files[@]}"; do
+    rm -f "$f"
+  done
+  cli_pids=()
+  cli_output_files=()
   local burned_fmt cost_msg
   burned_fmt=$(fmt_num "$burned")
   if ((cost_reported)); then
@@ -428,32 +460,61 @@ on_interrupt() {
 }
 trap on_interrupt INT
 
-# Run one CLI call in the background while animating flames. On success
-# leaves the parsed stdout in $last_output. Returns the CLI exit status.
-run_cli() {
-  local output_file
-  output_file=$(mktemp)
-  # </dev/null prevents codex from waiting on stdin when run in background.
-  "${cli_cmd[@]}" "$prompt" >"$output_file" 2>/dev/null </dev/null &
-  cli_pid=$!
+# Launch N CLI calls in the background. Populates cli_pids[] and cli_output_files[].
+launch_cli_calls() {
+  local n=$1
+  cli_pids=()
+  cli_output_files=()
+  local i output_file
+  for ((i = 0; i < n; i++)); do
+    output_file=$(mktemp)
+    cli_output_files+=("$output_file")
+    "${cli_cmd[@]}" "$prompt" >"$output_file" 2>/dev/null </dev/null &
+    cli_pids+=($!)
+  done
+}
 
-  local frame=0
-  while kill -0 "$cli_pid" 2>/dev/null; do
+# Animate while all launched calls run, then collect results into last_outputs[].
+# Retries any failed call once; aborts if the retry also fails.
+wait_for_cli_calls() {
+  last_outputs=()
+  local frame=0 any_alive pid
+
+  while true; do
+    any_alive=0
+    for pid in "${cli_pids[@]}"; do
+      kill -0 "$pid" 2>/dev/null && { any_alive=1; break; }
+    done
+    ((any_alive)) || break
     redraw_disco $((frame % 4))
     frame=$((frame + 1))
     sleep 0.4
   done
 
-  if wait "$cli_pid" 2>/dev/null; then
-    last_output=$(<"$output_file")
+  local i
+  for ((i = 0; i < ${#cli_pids[@]}; i++)); do
+    pid="${cli_pids[$i]}"
+    local output_file="${cli_output_files[$i]}"
+    if wait "$pid" 2>/dev/null; then
+      last_outputs+=("$(<"$output_file")")
+    else
+      draw_bar " (retrying)"
+      local retry_file
+      retry_file=$(mktemp)
+      if "${cli_cmd[@]}" "$prompt" >"$retry_file" 2>/dev/null </dev/null; then
+        last_outputs+=("$(<"$retry_file")")
+        rm -f "$retry_file"
+      else
+        rm -f "$retry_file"
+        rm -f "$output_file"
+        printf "\nerror: two consecutive %s calls failed; aborting.\n" "$backend" >&2
+        exit 1
+      fi
+    fi
     rm -f "$output_file"
-    cli_pid=""
-    return 0
-  else
-    rm -f "$output_file"
-    cli_pid=""
-    return 1
-  fi
+  done
+  cli_pids=()
+  cli_output_files=()
 }
 
 # Parse one CLI call's output into "<tokens> <cost>" (tab-separated).
@@ -495,32 +556,31 @@ draw_disco 0
 echo
 draw_bar
 
-while ((burned < tokens)); do
-  iteration=$((iteration + 1))
+while ((burned < total_target)); do
+  launch_cli_calls "$threads"
+  wait_for_cli_calls
 
-  if ! run_cli; then
-    draw_bar " (retrying)"
-    if ! run_cli; then
-      printf "\nerror: two consecutive %s calls failed; aborting.\n" "$backend" >&2
+  round_tokens=0
+  round_cost=0.000000
+  for last_output in "${last_outputs[@]}"; do
+    read -r this_call this_cost < <(parse_usage)
+    if ! [[ "$this_call" =~ ^[0-9]+$ ]]; then
+      printf "\nerror: could not parse token usage from %s output\n" "$backend" >&2
       exit 1
     fi
-  fi
+    round_tokens=$((round_tokens + this_call))
+    round_cost=$(awk -v a="$round_cost" -v b="$this_cost" 'BEGIN{printf "%.6f", a+b}')
+  done
 
-  read -r this_call this_cost < <(parse_usage)
-
-  if ! [[ "$this_call" =~ ^[0-9]+$ ]]; then
-    printf "\nerror: could not parse token usage from %s output\n" "$backend" >&2
-    exit 1
-  fi
-
-  burned=$((burned + this_call))
-  total_cost=$(awk -v a="$total_cost" -v b="$this_cost" 'BEGIN{printf "%.6f", a+b}')
+  burned=$((burned + round_tokens))
+  total_cost=$(awk -v a="$total_cost" -v b="$round_cost" 'BEGIN{printf "%.6f", a+b}')
+  iteration=$((iteration + threads))
   draw_bar
 done
 
 msg="${CELEBRATIONS[RANDOM % ${#CELEBRATIONS[@]}]}"
 burned_fmt=$(fmt_num "$burned")
-tokens_fmt=$(fmt_num "$tokens")
+tokens_fmt=$(fmt_num "$total_target")
 
 if ((cost_reported)); then
   cost_rounded=$(round_cents "$total_cost")
