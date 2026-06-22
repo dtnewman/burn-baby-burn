@@ -23,7 +23,7 @@ usage() {
 burn — spin up Claude Code or Codex in a loop to burn approximately N tokens.
 
 Usage:
-  burn TOKENS [--model MODEL] [--backend claude|codex]
+  burn TOKENS [--model MODEL] [--backend claude|codex] [--groove]
 
 Arguments:
   TOKENS         Target tokens to burn. Minimum per call:
@@ -34,6 +34,9 @@ Options:
   --model NAME       Model to pass through (e.g. haiku, sonnet, gpt-5).
   --backend NAME     Which CLI to drive: 'claude' or 'codex'.
                      Default: claude if installed, else codex.
+  --groove           Play Disco Inferno in the background while burning.
+                     Requires mpv (preferred) or yt-dlp + ffplay.
+  --simulate         Fake the burn: animate without calling any CLI or spending tokens.
   -h, --help         Show this help and exit.
 EOF
 }
@@ -41,6 +44,8 @@ EOF
 model=""
 tokens=""
 backend=""
+groove=0
+simulate=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
   -h | --help)
@@ -69,6 +74,14 @@ while [[ $# -gt 0 ]]; do
     ;;
   --backend=*)
     backend="${1#*=}"
+    shift
+    ;;
+  --groove)
+    groove=1
+    shift
+    ;;
+  --simulate)
+    simulate=1
     shift
     ;;
   --)
@@ -106,6 +119,8 @@ if [[ -z "$backend" ]]; then
     backend=claude
   elif command -v codex >/dev/null 2>&1; then
     backend=codex
+  elif ((simulate)); then
+    backend=claude  # simulate mode: pick a default for display purposes only
   else
     echo "error: neither 'claude' nor 'codex' found on PATH." >&2
     echo "       install Claude Code: https://docs.claude.com/claude-code" >&2
@@ -123,18 +138,20 @@ case "$backend" in
     ;;
 esac
 
-if ! command -v "$backend" >/dev/null 2>&1; then
-  echo "error: '$backend' CLI not found on PATH." >&2
-  case "$backend" in
-    claude) echo "       install Claude Code: https://docs.claude.com/claude-code" >&2 ;;
-    codex)  echo "       install Codex CLI:   https://github.com/openai/codex" >&2 ;;
-  esac
-  exit 1
-fi
-if ! command -v jq >/dev/null 2>&1; then
-  echo "error: 'jq' not found on PATH (used to parse CLI JSON output)." >&2
-  echo "       install with: brew install jq" >&2
-  exit 1
+if ! ((simulate)); then
+  if ! command -v "$backend" >/dev/null 2>&1; then
+    echo "error: '$backend' CLI not found on PATH." >&2
+    case "$backend" in
+      claude) echo "       install Claude Code: https://docs.claude.com/claude-code" >&2 ;;
+      codex)  echo "       install Codex CLI:   https://github.com/openai/codex" >&2 ;;
+    esac
+    exit 1
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "error: 'jq' not found on PATH (used to parse CLI JSON output)." >&2
+    echo "       install with: brew install jq" >&2
+    exit 1
+  fi
 fi
 
 TOKENS_PER_CALL=$((SYSTEM_OVERHEAD_TOKENS + FILLER_TOKENS))
@@ -376,7 +393,39 @@ draw_bar() {
     "$bar" "$pct" "$burned" "$tokens" "$(format_cost_field)" "$iteration" "$suffix"
 }
 
+GROOVE_PID=""
+GROOVE_TMPFILE=""
+
+play_groove() {
+  local url="https://www.youtube.com/watch?v=u5lSeYd_riw"
+  if command -v mpv >/dev/null 2>&1; then
+    mpv --no-video --really-quiet "$url" >/dev/null 2>&1 &
+    GROOVE_PID=$!
+  elif command -v yt-dlp >/dev/null 2>&1 && command -v ffplay >/dev/null 2>&1; then
+    yt-dlp -f bestaudio -o - "$url" 2>/dev/null | ffplay -nodisp -autoexit - >/dev/null 2>&1 &
+    GROOVE_PID=$!
+  elif command -v yt-dlp >/dev/null 2>&1 && command -v afplay >/dev/null 2>&1; then
+    GROOVE_TMPFILE=$(mktemp /tmp/burn-groove.XXXXXX.m4a)
+    (yt-dlp -f bestaudio/best -o "$GROOVE_TMPFILE" "$url" >/dev/null 2>&1 && afplay "$GROOVE_TMPFILE" >/dev/null 2>&1) &
+    GROOVE_PID=$!
+  else
+    printf '\n%swarning:%s --groove needs mpv, or yt-dlp + ffplay/afplay. Skipping music.\n' "$ORANGE" "$RESET" >&2
+  fi
+}
+
+stop_groove() {
+  if [[ -n "$GROOVE_PID" ]]; then
+    kill "$GROOVE_PID" 2>/dev/null || true
+    GROOVE_PID=""
+  fi
+  if [[ -n "$GROOVE_TMPFILE" ]] && [[ -f "$GROOVE_TMPFILE" ]]; then
+    rm -f "$GROOVE_TMPFILE"
+    GROOVE_TMPFILE=""
+  fi
+}
+
 restore_cursor() {
+  stop_groove
   printf '%s' "$SHOW_CURSOR"
 }
 trap restore_cursor EXIT
@@ -411,6 +460,7 @@ fmt_num() {
 }
 
 on_interrupt() {
+  stop_groove
   if [[ -n "$cli_pid" ]]; then
     kill "$cli_pid" 2>/dev/null || true
     wait "$cli_pid" 2>/dev/null || true
@@ -489,6 +539,8 @@ parse_usage() {
   esac
 }
 
+((groove)) && play_groove
+
 printf '%s' "$HIDE_CURSOR"
 echo
 draw_disco 0
@@ -498,31 +550,46 @@ draw_bar
 while ((burned < tokens)); do
   iteration=$((iteration + 1))
 
-  if ! run_cli; then
-    draw_bar " (retrying)"
+  if ((simulate)); then
+    sim_frame=0
+    sim_ticks=$(( (RANDOM % 20) + 8 ))  # 8–27 ticks × 0.4s = 3.2–10.8s
+    while (( sim_frame < sim_ticks )); do
+      redraw_disco $((sim_frame % 4))
+      sim_frame=$((sim_frame + 1))
+      sleep 0.4
+    done
+    burned=$((burned + TOKENS_PER_CALL))
+    draw_bar " (simulated)"
+  else
     if ! run_cli; then
-      printf "\nerror: two consecutive %s calls failed; aborting.\n" "$backend" >&2
+      draw_bar " (retrying)"
+      if ! run_cli; then
+        printf "\nerror: two consecutive %s calls failed; aborting.\n" "$backend" >&2
+        exit 1
+      fi
+    fi
+
+    read -r this_call this_cost < <(parse_usage)
+
+    if ! [[ "$this_call" =~ ^[0-9]+$ ]]; then
+      printf "\nerror: could not parse token usage from %s output\n" "$backend" >&2
       exit 1
     fi
+
+    burned=$((burned + this_call))
+    total_cost=$(awk -v a="$total_cost" -v b="$this_cost" 'BEGIN{printf "%.6f", a+b}')
+    draw_bar
   fi
-
-  read -r this_call this_cost < <(parse_usage)
-
-  if ! [[ "$this_call" =~ ^[0-9]+$ ]]; then
-    printf "\nerror: could not parse token usage from %s output\n" "$backend" >&2
-    exit 1
-  fi
-
-  burned=$((burned + this_call))
-  total_cost=$(awk -v a="$total_cost" -v b="$this_cost" 'BEGIN{printf "%.6f", a+b}')
-  draw_bar
 done
 
 msg="${CELEBRATIONS[RANDOM % ${#CELEBRATIONS[@]}]}"
 burned_fmt=$(fmt_num "$burned")
 tokens_fmt=$(fmt_num "$tokens")
 
-if ((cost_reported)); then
+if ((simulate)); then
+  printf "\n\n 🔥 simulated %s tokens across %s call(s) (target: %s) • 💰 spent \$0.00 (it's pretend)\n\n" \
+    "$burned_fmt" "$iteration" "$tokens_fmt"
+elif ((cost_reported)); then
   cost_rounded=$(round_cents "$total_cost")
   printf "\n\n 🔥 torched %s tokens across %s call(s) (target: %s) • 💰 spent \$%s 💵💵💵\n\n" \
     "$burned_fmt" "$iteration" "$tokens_fmt" "$cost_rounded"
